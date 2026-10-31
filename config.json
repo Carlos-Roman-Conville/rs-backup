@@ -1,0 +1,33 @@
+{
+  "root": "E:/backups/reality-sim",
+  "repos": {
+    "kernel": "E:/AI Programs/Toolchain/kernel",
+    "realism": "E:/AI Programs/Toolchain/realism",
+    "settlement": "E:/AI Programs/Toolchain/settlement",
+    "economy": "E:/AI Programs/Toolchain/economy",
+    "cognition": "E:/AI Programs/Toolchain/cognition",
+    "pirate-ship": "E:/AI Programs/Games/RPG's/pirate-ship",
+    "personality-matrix": "E:/AI Programs/Writing/Cognitive Function Diagnostic/personality matrix",
+    "content-pipeline": "E:/AI Programs/Art/creative-ai/content-pipeline"
+  },
+  "belt_repos_file": "E:/AI Programs/Games/Card Games/_agent/repos.txt",
+  "snapshot_sources": {
+    "Toolchain": "E:/AI Programs/Toolchain",
+    "HQ": "E:/AI Programs/HQ",
+    "belt-queue": "E:/AI Programs/Games/Card Games/_agent/queue",
+    "belt-agent": {"path": "E:/AI Programs/Games/Card Games/_agent", "exclude": ["queue", "__pycache__"]},
+    "pirate-files": "E:/AI Programs/Games/RPG's/pirate-ship/files",
+    "pirate-data": "E:/AI Programs/Games/RPG's/pirate-ship/data"
+  },
+  "exclude_dirs": ["node_modules", ".codex-runs"],
+  "retention": {"all_hours": 24, "hourly_days": 7, "daily_days": 60},
+  "restore_test_log": "E:/AI Programs/Toolchain/backup/logs/restore-test.jsonl",
+  "restore_test": {"repo": "kernel", "every_days": 7, "expect_tests": 149},
+  "gates": {
+    "kernel": ["npx vitest run", "npx tsc --noEmit"],
+    "realism": ["npx vitest run"],
+    "settlement": ["npx vitest run"],
+    "economy": ["npx vitest run"],
+    "cognition": ["npx vitest run"]
+  }
+}
