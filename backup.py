@@ -8,6 +8,7 @@
     python backup.py status                   # JSON: mirrors, snapshots, restore test (the dashboard reads this)
     python backup.py restore <repo> [--snapshot NAME] [--dest DIR] [--no-gates]
     python backup.py restore-test             # restore the kernel into a disposable folder, run its gates, compare hashes
+    python backup.py access-check             # as this account: tamper with a snapshot and a mirror ref; all must be refused
 
 Only the scheduled task (running the protected copy in <root>/bin) and the mirror push write under the backup root;
 an agent's belt unit reaches it only through `mirror --path`, which adds history and cannot remove any (the mirrors
@@ -103,11 +104,38 @@ def init_mirror(src: str, m: Path) -> None:
     code, head = git("symbolic-ref", "-q", "HEAD", cwd=src)
     if code == 0 and head.strip():
         git("symbolic-ref", "HEAD", head.strip(), cwd=m)
+    ensure_hook(m)
+
+
+# git applies receive.denyDeletes and receive.denyNonFastForwards to refs/heads/* only; this per-ref hook refuses a
+# delete or a non-fast-forward of ANY ref (tags, refs/rewritten/*, the canary). Found by the access check, 2026-10-31.
+UPDATE_HOOK = """#!/bin/sh
+# Backup mirror (Toolchain/backup): history may be added, never removed or rewritten.
+ref="$1"; old="$2"; new="$3"
+case "$new" in *[!0]*) ;; *) echo "backup mirror: refusing to delete $ref" >&2; exit 1 ;; esac
+case "$old" in *[!0]*) ;; *) exit 0 ;; esac
+[ "$old" = "$new" ] && exit 0
+git merge-base --is-ancestor "$old" "$new" 2>/dev/null && exit 0
+echo "backup mirror: refusing non-fast-forward update of $ref" >&2
+exit 1
+"""
+
+
+def ensure_hook(m: Path) -> None:
+    h = m / "hooks" / "update"
+    if h.is_file() and h.read_text(encoding="utf-8", errors="replace") == UPDATE_HOOK:
+        return
+    h.parent.mkdir(exist_ok=True)
+    if h.exists():
+        run(["icacls", str(h), "/remove:d", EVERYONE, "/C", "/Q"])
+    h.write_bytes(UPDATE_HOOK.encode("utf-8"))
+    run(["icacls", str(h), "/deny", f"{EVERYONE}:(WD,AD,WEA,DE)", "/C", "/Q"])
 
 
 def push(src: str, m: Path) -> str:
     """Push branches and tags. A branch the mirror refuses (non-fast-forward: amend, rebase) is kept as
-    refs/rewritten/<branch>/<stamp> instead, once per commit, so no commit is ever lost and none overwritten."""
+    refs/rewritten/<branch>/<stamp> instead, a moved tag as refs/rewritten/tags/<tag>/<stamp>, once per object, so
+    nothing is ever lost and nothing overwritten."""
     url = m.as_posix()
     code, out = git("push", "--porcelain", url, "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*", cwd=src)
     kept, rejected, updated = [], [], 0
@@ -118,9 +146,10 @@ def push(src: str, m: Path) -> str:
         flag, refs, summary = parts[0].strip(), parts[1], parts[2]
         if flag in ("*", "+", " ") and "up to date" not in summary:
             updated += 1
-        if flag == "!" and refs.startswith("refs/heads/"):
-            branch = refs.split(":", 1)[0][len("refs/heads/"):]
-            _, sha = git("rev-parse", f"refs/heads/{branch}", cwd=src)
+        if flag == "!" and refs.startswith(("refs/heads/", "refs/tags/")):
+            local = refs.split(":", 1)[0]
+            branch = local[len("refs/heads/"):] if local.startswith("refs/heads/") else local[len("refs/"):]
+            _, sha = git("rev-parse", local, cwd=src)
             sha = sha.strip()
             _, have = git("for-each-ref", "--format=%(objectname)", f"refs/rewritten/{branch}/", cwd=m)
             if sha in have.split():
@@ -282,8 +311,12 @@ def rmtree(p: Path) -> None:
     shutil.rmtree(p, onerror=again)
 
 
+SNAP_DENY = "(DE,DC,WD,AD,WEA)"  # no delete, no write/append (or add file/subfolder), no extended-attribute writes;
+                                 # write-attributes stays allowed: the next snapshot hard-links these files
+
+
 def protect(p: Path) -> int:
-    code, _ = run(["icacls", str(p), "/deny", f"{EVERYONE}:(DE,DC)", "/T", "/C", "/Q"], timeout=3600)
+    code, _ = run(["icacls", str(p), "/deny", f"{EVERYONE}:{SNAP_DENY}", "/T", "/C", "/Q"], timeout=3600)
     return code
 
 
@@ -318,6 +351,7 @@ def cmd_snapshot(a, c) -> int:
                 "sources": c["snapshot_sources"], "exclude_dirs": sorted(ex), **st,
                 "errors": st["errors"][:200], "error_count": len(st["errors"]),
                 "links_skipped": st["links_skipped"][:200], "links_skipped_count": len(st["links_skipped"])}
+    (work / CANARY).write_text("access-check target: write, append, delete and ACL changes must all fail\n", encoding="utf-8")
     (work / "MANIFEST.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     pc = protect(work)
     print(f"backup: snapshot {name}: {st['copied']} copied ({st['bytes'] / 1e6:.1f} MB), {st['linked']} linked, "
@@ -406,8 +440,22 @@ def status(c: dict | None = None, detail_all: bool = False) -> dict:
         except (OSError, ValueError):
             latest = {"name": ss[-1].name}
     lr = root(c) / "logs" / "last-run.json"
+    # Recovery point objective (Rex, 2026-10-31): minutes of completed work a loss right now would cost. Files: time
+    # since the latest snapshot started. Commits: for a platform repo whose HEAD is not in its mirror, time since
+    # that HEAD was committed. The larger is the RPO; target 30 minutes.
+    now = dt.datetime.now()
+    rpo = {"snapshot_min": None, "unmirrored": [], "minutes": None, "target": 30}
+    if latest and latest.get("at"):
+        rpo["snapshot_min"] = round((now - dt.datetime.fromisoformat(latest["at"])).total_seconds() / 60)
+    for p in platform:
+        if p["is_repo"] and not p["covered"]:
+            _, ct = git("log", "-1", "--format=%ct", cwd=c["repos"][p["repo"]])
+            if ct.strip().isdigit():
+                rpo["unmirrored"].append({"repo": p["repo"], "minutes": round((now.timestamp() - int(ct)) / 60)})
+    ages = ([rpo["snapshot_min"]] if rpo["snapshot_min"] is not None else []) + [u["minutes"] for u in rpo["unmirrored"]]
+    rpo["minutes"] = max(ages) if ages else None
     return {"root": str(root(c)), "platform": platform, "belt_repos": len(belt), "belt_mirrored": belt_mirrored,
-            "snapshots": len(ss), "latest_snapshot": latest,
+            "snapshots": len(ss), "latest_snapshot": latest, "rpo": rpo,
             "last_run": json.loads(lr.read_text(encoding="utf-8")) if lr.is_file() else None,
             "restore_test": last_restore_test(c)}
 
@@ -616,11 +664,103 @@ def restore_test(c: dict, keep: bool = False) -> dict:
                     row["cleanup"] = f"left in place: {e}"
         else:
             row["cleanup"] = f"kept at {dest}"
+    row["access"] = access_check(c)  # Rex 2026-10-31: the restore test includes the hostile-access attempts
     f = Path(c.get("restore_test_log", HERE / "logs" / "restore-test.jsonl"))
     f.parent.mkdir(parents=True, exist_ok=True)
     with open(f, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(row) + "\n")
     return row
+
+
+# ---------------------------------------------------------------- access check (Rex, 2026-10-31)
+
+CANARY = "CANARY.txt"
+CANARY_REF = "refs/canary/backup"
+
+
+def whoami() -> str:
+    _, out = run(["whoami"])
+    return out.strip()
+
+
+def ensure_canary_ref(m: Path) -> None:
+    """The mirror's access-check target: a ref nothing else uses, recreated by the scheduled task when missing."""
+    if git("rev-parse", "-q", "--verify", CANARY_REF, cwd=m)[0] != 0:
+        code, head = git("rev-parse", "-q", "--verify", "HEAD", cwd=m)
+        if code == 0:
+            git("update-ref", CANARY_REF, head.strip(), cwd=m)
+
+
+def access_check(c: dict) -> dict:
+    """Attempt, as the account running this, what a build agent must not be able to do to the backups: change and
+    delete a snapshot file, rename a snapshot, delete a mirror ref (by push and by direct ref edit), and lift the
+    deny ACE. Every attempt must be refused. Anything that gets through is put back at once and reported."""
+    res = {"at": dt.datetime.now().isoformat(timespec="seconds"), "account": whoami(), "checks": []}
+
+    def check(what: str, attempt) -> None:
+        try:
+            ok, note = attempt()
+        except OSError as e:
+            ok, note = False, type(e).__name__
+        res["checks"].append({"attempt": what, "result": "ALLOWED" if ok else "refused", "note": note})
+
+    snap = next((p for p in reversed(snaps(c)) if (p / CANARY).is_file()), None)
+    if snap:
+        can = snap / CANARY
+
+        def append():
+            with open(can, "a", encoding="utf-8") as fh:
+                fh.write("tampered\n")
+            return True, f"{snap.name}/{CANARY}"
+
+        def delete():
+            os.unlink(can)
+            can.write_text("access-check target (recreated after a successful delete)\n", encoding="utf-8")
+            return True, f"{snap.name}/{CANARY}"
+
+        def rename():
+            moved = snap.with_name(snap.name + "-moved")
+            os.rename(snap, moved)
+            os.rename(moved, snap)
+            return True, snap.name
+
+        def lift_acl():
+            code, out = run(["icacls", str(can), "/remove:d", EVERYONE, "/C"])
+            lifted = code == 0 and "Successfully processed 1" in out
+            if lifted:
+                run(["icacls", str(can), "/deny", f"{EVERYONE}:{SNAP_DENY}", "/C", "/Q"])
+            return lifted, "icacls /remove:d (deny re-applied at once)" if lifted else out.strip()[-120:]
+
+        check("append to a snapshot file", append)
+        check("delete a snapshot file", delete)
+        check("rename a snapshot folder", rename)
+        check("remove the snapshot's deny ACE (owner's WRITE_DAC)", lift_acl)
+    else:
+        res["checks"].append({"attempt": "snapshot checks", "result": "not run", "note": f"no snapshot with {CANARY} yet"})
+    m = mirror_dir(c, c["restore_test"]["repo"])
+    code, sha = git("rev-parse", "-q", "--verify", CANARY_REF, cwd=m) if m.is_dir() else (1, "")
+    if code == 0:
+        sha = sha.strip()
+
+        def push_delete():
+            code, out = git("push", "--porcelain", m.as_posix(), f":{CANARY_REF}", cwd=m)
+            return code == 0 and git("rev-parse", "-q", "--verify", CANARY_REF, cwd=m)[0] != 0, out.strip()[-120:]
+
+        def direct_delete():
+            code, out = git("update-ref", "-d", CANARY_REF, cwd=m)
+            gone = git("rev-parse", "-q", "--verify", CANARY_REF, cwd=m)[0] != 0
+            if gone:
+                git("update-ref", CANARY_REF, sha, cwd=m)
+            return gone, "git update-ref -d in the mirror (ref restored at once)" if gone else out.strip()[-120:]
+
+        check(f"delete mirror ref {CANARY_REF} by push", push_delete)
+        check(f"delete mirror ref {CANARY_REF} by editing the mirror", direct_delete)
+    else:
+        res["checks"].append({"attempt": "mirror checks", "result": "not run", "note": f"no {CANARY_REF} in {m.name} yet"})
+    ran = [x for x in res["checks"] if x["result"] != "not run"]
+    res["pass"] = bool(ran) and all(x["result"] == "refused" for x in res["checks"])
+    res["allowed"] = [x["attempt"] for x in res["checks"] if x["result"] == "ALLOWED"]
+    return res
 
 
 # ---------------------------------------------------------------- the scheduled job
@@ -636,22 +776,35 @@ def cmd_run(a, c) -> int:
         if state != "skipped" or n in c["repos"]:
             lines.append(f"mirror {n}: {state}: {msg}")
         if mirror_dir(c, n).is_dir():
+            ensure_hook(mirror_dir(c, n))
+            if n == c["restore_test"]["repo"]:
+                ensure_canary_ref(mirror_dir(c, n))
             protect_mirror(mirror_dir(c, n))
     import io
     import contextlib
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
+        for s in snaps(c):  # snapshots written before 2026-10-31 denied only delete: add the write denies once
+            if "WD" not in run(["icacls", str(s)])[1]:
+                protect(s)
         sc = cmd_snapshot(a, c)
         cmd_prune(argparse.Namespace(dry=False), c)
     lines += buf.getvalue().splitlines()
     rt = last_restore_test(c)
     due = not rt or not rt.get("pass") or (dt.datetime.now() - dt.datetime.fromisoformat(rt["at"])).days >= c["restore_test"]["every_days"]
-    if due and mirror_dir(c, c["restore_test"]["repo"]).is_dir():
+    # Once a dedicated account runs this job (HQ/handoffs/backup/HANDOFF.md §5), the restore test and the access
+    # check move to a task that runs as the agent account: set both switches false in config.json.
+    if c.get("restore_test_in_run", True) and due and mirror_dir(c, c["restore_test"]["repo"]).is_dir():
         r = restore_test(c)
         lines.append(f"restore test {r['repo']}: {'PASS' if r['pass'] else 'FAIL'}: {r.get('reason')}")
+    acc = None
+    if c.get("access_check_in_run", True):
+        acc = access_check(c)
+        lines.append(f"access check as {acc['account']}: {'PASS' if acc['pass'] else 'FAIL'}"
+                     + (f": allowed {', '.join(acc['allowed'])}" if acc["allowed"] else ""))
     summary = {"at": t0.isoformat(timespec="seconds"), "seconds": round((dt.datetime.now() - t0).total_seconds()),
                "mirrors_ok": sum(v == "ok" for v in mirrors.values()), "mirrors_failed": sum(v == "failed" for v in mirrors.values()),
-               "snapshot_exit": sc}
+               "failed": [n for n, v in mirrors.items() if v == "failed"], "snapshot_exit": sc, "access": acc}
     with open(logd / f"run-{t0:%Y-%m}.log", "a", encoding="utf-8") as fh:
         fh.write(f"=== {t0:%Y-%m-%d %H:%M:%S} ({summary['seconds']}s)\n" + "\n".join(lines) + "\n")
     (logd / "last-run.json").write_text(json.dumps(summary), encoding="utf-8")
@@ -678,6 +831,7 @@ def main(argv=None) -> int:
     r.add_argument("--no-gates", action="store_true")
     t = sub.add_parser("restore-test")
     t.add_argument("--keep", action="store_true")
+    sub.add_parser("access-check")
     a = ap.parse_args(argv)
     c = cfg()
     if a.cmd == "mirror":
@@ -701,6 +855,10 @@ def main(argv=None) -> int:
         row = restore_test(c, keep=a.keep)
         print(json.dumps(row, indent=1))
         return 0 if row["pass"] else 1
+    if a.cmd == "access-check":
+        res = access_check(c)
+        print(json.dumps(res, indent=1))
+        return 0 if res["pass"] else 1
     return 2
 
 

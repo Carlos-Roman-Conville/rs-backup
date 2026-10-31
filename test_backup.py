@@ -63,6 +63,16 @@ class BackupTest(unittest.TestCase):
         # deleting a branch in the mirror is refused
         r = subprocess.run(["git", "push", m.as_posix(), ":refs/heads/main"], cwd=self.src, capture_output=True, text=True)
         self.assertNotEqual(r.returncode, 0)
+        # ...and so is deleting or moving a tag (git's own deny settings cover refs/heads/* only; the hook covers the rest)
+        amended = sh("git", "rev-parse", "HEAD", cwd=self.src).strip()
+        sh("git", "tag", "v1", amended, cwd=self.src)
+        backup.mirror_one(self.c, "repo", str(self.src), init=False)
+        r = subprocess.run(["git", "push", m.as_posix(), ":refs/tags/v1"], cwd=self.src, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        sh("git", "tag", "-f", "v1", first, cwd=self.src)  # not a descendant of the mirrored tag
+        r = subprocess.run(["git", "push", "-f", m.as_posix(), "refs/tags/v1"], cwd=self.src, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sh("git", "rev-parse", "refs/tags/v1", cwd=m).strip(), amended)
         # pushes still work after the mirror is delete-protected, and the objects cannot be deleted
         backup.protect_mirror(m)
         commit(self.src, "b.txt", "two", "second")
@@ -135,6 +145,25 @@ class BackupTest(unittest.TestCase):
         self.assertEqual((d / "new.txt").read_text(), "untracked")
         with self.assertRaises(SystemExit):
             backup.restore(self.c, "repo", dest=d, gates=False)
+
+    def test_access_check_reports_what_this_account_can_do(self):
+        backup.mirror_one(self.c, "repo", str(self.src), init=True)
+        m = backup.mirror_dir(self.c, "repo")
+        backup.ensure_canary_ref(m)
+        backup.cmd_snapshot(backup.argparse.Namespace(), self.c)
+        res = backup.access_check(self.c)
+        got = {x["attempt"]: x["result"] for x in res["checks"]}
+        self.assertEqual(got["append to a snapshot file"], "refused")
+        self.assertEqual(got["delete a snapshot file"], "refused")
+        self.assertEqual(got["rename a snapshot folder"], "refused")
+        self.assertEqual(got[f"delete mirror ref {backup.CANARY_REF} by push"], "refused")
+        # The owner account can still edit a ref file and lift a deny ACE: the check must say so, and put both back.
+        self.assertEqual(got[f"delete mirror ref {backup.CANARY_REF} by editing the mirror"], "ALLOWED")
+        self.assertEqual(got["remove the snapshot's deny ACE (owner's WRITE_DAC)"], "ALLOWED")
+        self.assertFalse(res["pass"])
+        self.assertEqual(subprocess.run(["git", "rev-parse", "-q", "--verify", backup.CANARY_REF], cwd=m).returncode, 0)
+        with self.assertRaises(PermissionError):
+            (backup.snaps(self.c)[-1] / backup.CANARY).unlink()
 
     def test_restore_from_protected_mirror_is_disposable(self):
         backup.mirror_one(self.c, "repo", str(self.src), init=True)
