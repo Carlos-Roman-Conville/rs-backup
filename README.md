@@ -31,5 +31,5 @@ checkpoints. Spec: `HQ/handoffs/controller/BACKUP.md`. Keeper: backup keeper (`H
     python backup.py status                  # JSON the dashboard reads
     python backup.py mirror --repo kernel    # push one repo (needs its mirror)
     python backup.py prune --dry             # what retention would remove
-    python test_backup.py                    # 5 tests on a throwaway root
+    python test_backup.py                    # 6 tests on a throwaway root
     .\install.ps1 -CopyOnly                  # refresh the protected copy after editing backup.py or config.json
