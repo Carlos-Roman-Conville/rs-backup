@@ -27,7 +27,7 @@
     "pirate-files": "E:/AI Programs/Games/RPG's/pirate-ship/files",
     "pirate-data": "E:/AI Programs/Games/RPG's/pirate-ship/data"
   },
-  "exclude_dirs": ["node_modules", ".codex-runs"],
+  "exclude_dirs": ["node_modules", ".codex-runs", "history-runs"],
   "retention": {"all_hours": 24, "hourly_days": 7, "daily_days": 60},
   "restore_test_log": "E:/AI Programs/Toolchain/backup/logs/restore-test.jsonl",
   "restore_test": {"repo": "kernel", "every_days": 7, "expect_tests": 149},
