@@ -14,7 +14,7 @@
   },
   "platform_dirs": ["E:/AI Programs/Toolchain"],
   "offsite": {
-    "enabled": false,
+    "enabled": true,
     "base": "https://github.com/Carlos-Roman-Conville/",
     "names": {"realism": "rs-life", "platform": "rs-platform"}
   },
