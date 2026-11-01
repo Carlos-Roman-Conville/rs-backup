@@ -20,6 +20,8 @@ checkpoints. Spec: `HQ/handoffs/controller/BACKUP.md`. Keeper: backup keeper (`H
 
 ## Rules
 
+- **The mirror paths are fixed.** Engines install each other from them (`"@rex/kernel": "git+file:///E:/backups/reality-sim/git/kernel.git#vX.Y.Z"`, kernel DESIGN §16, CTRL-22), so lockfiles pin `E:/backups/reality-sim/git/<repo>.git`. Use the `file://` form (a plain-path clone hard-links the protected objects). Tags are append-only: a moved tag is kept under `refs/rewritten/tags/`, the original stays.
+
 - Agents never write under `E:\backups` except through the mirror push. `install.ps1`, `backup.py run`,
   `snapshot` and `prune` are for the scheduled task, Rex, or the backup keeper.
 - Never `rm -rf`/`Remove-Item -Recurse` anything under `E:\backups`; the denies will stop it part-way.
