@@ -206,6 +206,73 @@ def protect_mirror(m: Path) -> None:
         run(["icacls", str(m / "objects"), "/deny", f"{EVERYONE}:(DE,DC)", "/T", "/C", "/Q"], timeout=3600)
 
 
+# ---------------------------------------------------------------- off-site (Rex, 2026-10-31: GitHub rs-* repos)
+
+def offsite_url(c: dict, name: str) -> str:
+    o = c.get("offsite", {})
+    return o.get("base", "") + o.get("names", {}).get(name, f"rs-{name}") + ".git"
+
+
+def offsite_state(c: dict) -> dict:
+    f = root(c) / "logs" / "offsite.json"
+    try:
+        return json.loads(f.read_text(encoding="utf-8")) if f.is_file() else {}
+    except ValueError:
+        return {}
+
+
+def refs_digest(m: Path) -> str:
+    _, refs = git("for-each-ref", "--format=%(objectname) %(refname)", cwd=m)
+    return hashlib.sha256(refs.encode()).hexdigest()[:16]
+
+
+def offsite_push(c: dict, name: str) -> tuple[str, str]:
+    """Push one local mirror's branches, tags and rewritten refs to its GitHub repo: never a delete, never a force.
+    Skipped quietly when the repo does not exist there. Uses the machine's credential helper, never a stored token,
+    and never prompts (a missing credential is a failure to report, not a login window)."""
+    m = mirror_dir(c, name)
+    if not m.is_dir():
+        return "skipped", "no local mirror"
+    url = offsite_url(c, name)
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
+    code, out = git("ls-remote", "--heads", url, env=env)
+    if code != 0:
+        if "not found" in out.lower() or "does not appear to be a git repository" in out:
+            return "skipped", f"{url} does not exist"
+        return "failed", f"cannot reach {url}: {out.strip()[-200:]}"
+    code, out = git("push", "--porcelain", url, "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*",
+                    "refs/rewritten/*:refs/rewritten/*", cwd=m, env=env)
+    bad = [l for l in out.splitlines() if l.startswith("!")]
+    if code != 0 or bad:
+        return "failed", "; ".join(bad)[-300:] or out.strip()[-300:]
+    return "ok", f"pushed to {url}"
+
+
+def offsite_all(c: dict, only: str | None = None) -> list[str]:
+    """The off-site step of the job (never the belt hook: it writes the state file under the backup root)."""
+    st, lines = offsite_state(c), []
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    used: dict[str, str] = {}
+    for n in ([only] if only else list(platform_repos(c))):
+        url = offsite_url(c, n)
+        if url in used:  # e.g. realism -> rs-life while a `life` repo also exists: never mix two histories
+            result, msg = "failed", f"{url} is already {used[url]}'s off-site repo; give {n} its own in config offsite.names"
+        else:
+            result, msg = offsite_push(c, n)
+            if result != "skipped":
+                used[url] = n
+        if result != "skipped" or n in st:
+            lines.append(f"offsite {n}: {result}: {msg}")
+        if result == "ok":
+            st[n] = {"at": now, "refs": refs_digest(mirror_dir(c, n)), "url": offsite_url(c, n)}
+        elif result == "failed":
+            st.setdefault(n, {})["last_failure"] = {"at": now, "msg": msg}
+    f = root(c) / "logs" / "offsite.json"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(st, indent=1), encoding="utf-8")
+    return lines
+
+
 def cmd_mirror(a, c) -> int:
     rs = repos(c)
     if a.path:
@@ -479,8 +546,23 @@ def status(c: dict | None = None, detail_all: bool = False) -> dict:
                 rpo["unmirrored"].append({"repo": p["repo"], "minutes": round((now.timestamp() - int(ct)) / 60)})
     ages = ([rpo["snapshot_min"]] if rpo["snapshot_min"] is not None else []) + [u["minutes"] for u in rpo["unmirrored"]]
     rpo["minutes"] = max(ages) if ages else None
+    # Off-site: per platform repo, the last GitHub push; a repo whose local mirror moved since then has been at risk
+    # (if this machine is lost) since that push. Reported beside the local RPO, not inside it, while it is off.
+    off = {"enabled": bool(c.get("offsite", {}).get("enabled")), "repos": [], "minutes": None}
+    ost = offsite_state(c)
+    for n in plat:
+        s = ost.get(n, {})
+        stale = None
+        if s.get("at") and mirror_dir(c, n).is_dir() and refs_digest(mirror_dir(c, n)) != s.get("refs"):
+            stale = round((now - dt.datetime.fromisoformat(s["at"])).total_seconds() / 60)
+        off["repos"].append({"repo": n, "last": s.get("at"), "behind_min": stale or 0 if s.get("at") else None,
+                             "failure": (s.get("last_failure") or {}).get("msg")})
+    known = [r["behind_min"] for r in off["repos"] if r["behind_min"] is not None]
+    off["minutes"] = max(known) if known else None
+    if off["enabled"] and off["minutes"] is not None:
+        rpo["minutes"] = max(rpo["minutes"] or 0, off["minutes"])
     return {"root": str(root(c)), "platform": platform, "belt_repos": len(belt), "belt_mirrored": belt_mirrored,
-            "snapshots": len(ss), "latest_snapshot": latest, "rpo": rpo,
+            "snapshots": len(ss), "latest_snapshot": latest, "rpo": rpo, "offsite": off,
             "last_run": json.loads(lr.read_text(encoding="utf-8")) if lr.is_file() else None,
             "restore_test": last_restore_test(c)}
 
@@ -806,6 +888,8 @@ def cmd_run(a, c) -> int:
             if n == c["restore_test"]["repo"]:
                 ensure_canary_ref(mirror_dir(c, n))
             protect_mirror(mirror_dir(c, n))
+    if c.get("offsite", {}).get("enabled"):
+        lines += offsite_all(c)
     import io
     import contextlib
     buf = io.StringIO()
@@ -858,6 +942,8 @@ def main(argv=None) -> int:
     t = sub.add_parser("restore-test")
     t.add_argument("--keep", action="store_true")
     sub.add_parser("access-check")
+    o = sub.add_parser("offsite")
+    o.add_argument("--repo")
     a = ap.parse_args(argv)
     c = cfg()
     if a.cmd == "mirror":
@@ -881,6 +967,13 @@ def main(argv=None) -> int:
         row = restore_test(c, keep=a.keep)
         print(json.dumps(row, indent=1))
         return 0 if row["pass"] else 1
+    if a.cmd == "offsite":
+        if not c.get("offsite", {}).get("enabled"):
+            print("backup: off-site push is disabled (config offsite.enabled); nothing pushed")
+            return 0
+        lines = offsite_all(c, a.repo)
+        print("\n".join(lines))
+        return 1 if any(": failed:" in l for l in lines) else 0
     if a.cmd == "access-check":
         res = access_check(c)
         print(json.dumps(res, indent=1))

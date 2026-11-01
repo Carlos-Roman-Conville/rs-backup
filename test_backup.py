@@ -160,6 +160,26 @@ class BackupTest(unittest.TestCase):
         with self.assertRaises(PermissionError):
             (backup.snaps(self.c)[-1] / backup.CANARY).unlink()
 
+    def test_offsite_pushes_existing_remote_skips_missing_and_reports_rpo(self):
+        remote = self.tmp / "remote"
+        remote.mkdir()
+        sh("git", "init", "-q", "--bare", str(remote / "rs-repo.git"))
+        self.c["offsite"] = {"enabled": True, "base": remote.as_posix() + "/", "names": {}}
+        self.c["repos"]["other"] = str(self.src)  # same source, its off-site repo (rs-other) does not exist
+        backup.mirror_one(self.c, "repo", str(self.src), init=True)
+        backup.mirror_one(self.c, "other", str(self.src), init=True)
+        lines = backup.offsite_all(self.c)
+        self.assertTrue(any(l.startswith("offsite repo: ok") for l in lines), lines)
+        self.assertFalse(any(l.startswith("offsite other") for l in lines), lines)  # skipped quietly
+        head = sh("git", "rev-parse", "HEAD", cwd=self.src).strip()
+        self.assertEqual(sh("git", "rev-parse", "main", cwd=remote / "rs-repo.git").strip(), head)
+        off = backup.status(self.c)["offsite"]
+        self.assertEqual(next(r for r in off["repos"] if r["repo"] == "repo")["behind_min"], 0)
+        commit(self.src, "b.txt", "two", "second")
+        backup.mirror_one(self.c, "repo", str(self.src), init=False)
+        off = backup.status(self.c)["offsite"]
+        self.assertIsNotNone(next(r for r in off["repos"] if r["repo"] == "repo")["behind_min"])
+
     def test_restore_from_protected_mirror_is_disposable(self):
         backup.mirror_one(self.c, "repo", str(self.src), init=True)
         backup.protect_mirror(backup.mirror_dir(self.c, "repo"))
