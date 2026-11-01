@@ -107,18 +107,32 @@ def mirror_dir(c: dict, name: str) -> Path:
     return root(c) / "git" / f"{name}.git"
 
 
+MIRROR_CONFIG = (("receive.denyDeletes", "true"), ("receive.denyNonFastForwards", "true"),
+                 ("receive.denyDeleteCurrent", "true"), ("core.logAllRefUpdates", "always"),
+                 ("gc.auto", "0"), ("receive.autogc", "false"), ("gc.pruneExpire", "never"),
+                 ("gc.reflogExpire", "never"), ("gc.reflogExpireUnreachable", "never"))
+
+
 def init_mirror(src: str, m: Path) -> None:
     m.parent.mkdir(parents=True, exist_ok=True)
     git("init", "--bare", "-q", str(m))
-    for k, v in (("receive.denyDeletes", "true"), ("receive.denyNonFastForwards", "true"),
-                 ("receive.denyDeleteCurrent", "true"), ("core.logAllRefUpdates", "always"),
-                 ("gc.auto", "0"), ("receive.autogc", "false"), ("gc.pruneExpire", "never"),
-                 ("gc.reflogExpire", "never"), ("gc.reflogExpireUnreachable", "never")):
-        git("config", k, v, cwd=m)
+    ensure_config(m)
     code, head = git("symbolic-ref", "-q", "HEAD", cwd=src)
     if code == 0 and head.strip():
         git("symbolic-ref", "HEAD", head.strip(), cwd=m)
     ensure_hook(m)
+
+
+def ensure_config(m: Path) -> None:
+    """A run killed while creating a mirror leaves it without its settings: check the config file (no git call
+    when it is complete) and apply any that are missing before anything is pushed."""
+    try:
+        text = (m / "config").read_text(encoding="utf-8", errors="replace").lower()
+    except OSError:
+        text = ""
+    for k, v in MIRROR_CONFIG:
+        if f"{k.split('.', 1)[1].lower()} = {v}" not in text:
+            git("config", k, v, cwd=m)
 
 
 # git applies receive.denyDeletes and receive.denyNonFastForwards to refs/heads/* only; this per-ref hook refuses a
@@ -194,6 +208,8 @@ def mirror_one(c: dict, name: str, src: str, init: bool) -> tuple[str, str]:
         if not init:
             return "skipped", f"no mirror at {m} (the scheduled task creates it)"
         init_mirror(src, m)
+    else:
+        ensure_config(m)
     msg = push(src, m)
     return ("failed" if ("REJECTED" in msg or msg.startswith("push failed")) else "ok"), msg
 
@@ -878,28 +894,36 @@ def cmd_run(a, c) -> int:
     t0 = dt.datetime.now()
     lines, mirrors = [], {}
     plat = platform_repos(c)
-    for n, p in repos(c).items():
-        state, msg = mirror_one(c, n, p, init=True)
-        mirrors[n] = state
-        if state != "skipped" or n in plat:
-            lines.append(f"mirror {n}: {state}: {msg}")
-        if mirror_dir(c, n).is_dir():
-            ensure_hook(mirror_dir(c, n))
-            if n == c["restore_test"]["repo"]:
-                ensure_canary_ref(mirror_dir(c, n))
-            protect_mirror(mirror_dir(c, n))
-    if c.get("offsite", {}).get("enabled"):
-        lines += offsite_all(c)
+
+    def mirror_set(names: dict[str, str]) -> None:
+        for n, p in names.items():
+            m = mirror_dir(c, n)
+            new = not m.is_dir()
+            state, msg = mirror_one(c, n, p, init=True)
+            mirrors[n] = state
+            if state != "skipped" or n in plat:
+                lines.append(f"mirror {n}: {state}: {msg}")
+            if m.is_dir():
+                ensure_hook(m)
+                if n == c["restore_test"]["repo"]:
+                    ensure_canary_ref(m)
+                # icacls /T over a mirror's objects is the slow part: only where something was written this run
+                if new or not msg.startswith("0 ref(s) updated"):
+                    protect_mirror(m)
+
+    # Order (BKP-17): the platform repos, then the snapshot (the recovery point the RPO measures), then the belt's
+    # game repos, of which there are 120+ and growing, so they can never delay the snapshot.
+    mirror_set(plat)
     import io
     import contextlib
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        for s in snaps(c):  # snapshots written before 2026-10-31 denied only delete: add the write denies once
-            if "WD" not in run(["icacls", str(s)])[1]:
-                protect(s)
         sc = cmd_snapshot(a, c)
         cmd_prune(argparse.Namespace(dry=False), c)
     lines += buf.getvalue().splitlines()
+    mirror_set({n: p for n, p in repos(c).items() if n not in plat})
+    if c.get("offsite", {}).get("enabled"):
+        lines += offsite_all(c)
     rt = last_restore_test(c)
     due = not rt or not rt.get("pass") or (dt.datetime.now() - dt.datetime.fromisoformat(rt["at"])).days >= c["restore_test"]["every_days"]
     # Once a dedicated account runs this job (HQ/handoffs/backup/HANDOFF.md §5), the restore test and the access

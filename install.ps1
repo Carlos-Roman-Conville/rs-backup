@@ -21,7 +21,9 @@ if ($CopyOnly) { exit 0 }
 $pyw = (Get-Command pythonw.exe).Source
 $action = New-ScheduledTaskAction -Execute $pyw -Argument "`"$bin\backup.py`" run" -WorkingDirectory $bin
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 30)
-$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 2) `
+# -Priority 4 (normal): the default 7 runs the job as a background process with low I/O, and under a busy belt each
+# git call took ~20 s, so one run outlasted the next two (BKP-17).
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 2) -Priority 4 `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskPath '\RealitySim\' -TaskName 'Backup' -Action $action -Trigger $trigger -Settings $settings `
     -Description 'Reality-sim backup (Toolchain/backup): mirror every repo, dated protected snapshot, prune, weekly restore test.' -Force | Out-Null
