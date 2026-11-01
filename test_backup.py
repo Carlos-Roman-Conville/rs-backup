@@ -106,12 +106,7 @@ class BackupTest(unittest.TestCase):
     def test_second_snapshot_hardlinks_and_prune_reprotects(self):
         a = backup.argparse.Namespace()
         backup.mirror_one(self.c, "repo", str(self.src), init=True)
-        backup.cmd_snapshot(a, self.c)
-        s1 = backup.snaps(self.c)[-1]
-        # a second snapshot in another minute name
-        backup.unprotect(s1)
-        os.rename(s1, s1.with_name("2000-01-01-0000"))
-        backup.protect(s1.with_name("2000-01-01-0000"))
+        backup.cmd_snapshot(backup.argparse.Namespace(now=dt.datetime(2000, 1, 1)), self.c)  # old enough to prune
         backup.cmd_snapshot(a, self.c)
         old, new = backup.snaps(self.c)
         self.assertEqual(os.stat(new / "live" / "repo" / "a.txt").st_ino, os.stat(old / "live" / "repo" / "a.txt").st_ino)

@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -67,9 +68,22 @@ def norm(p: str | Path) -> str:
 
 # ---------------------------------------------------------------- repos and mirrors
 
-def repos(c: dict) -> dict[str, str]:
-    """name -> path: the platform repos in config.json, then every belt repo in repos.txt that is a git repo."""
+def platform_repos(c: dict) -> dict[str, str]:
+    """config.json `repos`, plus every git repo directly under a `platform_dirs` folder (a new keeper's repo is
+    mirrored from the next run on, without a config edit)."""
     out = dict(c["repos"])
+    known = {norm(p) for p in out.values()}
+    for d in c.get("platform_dirs", []):
+        for p in sorted(Path(d).iterdir()) if Path(d).is_dir() else []:
+            if p.is_dir() and (p / ".git").exists() and norm(p) not in known and p.name not in out:
+                out[p.name] = str(p)
+                known.add(norm(p))
+    return out
+
+
+def repos(c: dict) -> dict[str, str]:
+    """name -> path: the platform repos, then every belt repo in repos.txt that is a git repo."""
+    out = platform_repos(c)
     f = Path(c.get("belt_repos_file", ""))
     if f.is_file():
         base = f.parent.parent  # repos.txt paths are relative to games/ (Games/Card Games)
@@ -303,11 +317,21 @@ def bundle_mirrors(c: dict, snap: Path, prev: Path | None, st: dict) -> None:
 
 
 def rmtree(p: Path) -> None:
-    """shutil.rmtree that clears the read-only bit git sets on objects. Callers check for reparse points first or
-    hold a tree this script wrote without any."""
+    """shutil.rmtree that clears the read-only bit git sets on objects, and waits out a scanner briefly holding a
+    just-written file (WinError 32). Callers check for reparse points first or hold a tree this script wrote."""
     def again(fn, path, _exc):
-        os.chmod(path, 0o666)
-        fn(path)
+        try:
+            os.chmod(path, 0o666)
+        except OSError:
+            pass
+        for i in range(8):
+            try:
+                fn(path)
+                return
+            except PermissionError:
+                if i == 7:
+                    raise
+                time.sleep(0.5 * (i + 1))
     shutil.rmtree(p, onerror=again)
 
 
@@ -328,7 +352,7 @@ def unprotect(p: Path) -> int:
 def cmd_snapshot(a, c) -> int:
     base = root(c) / "snap"
     base.mkdir(parents=True, exist_ok=True)
-    now = dt.datetime.now()
+    now = getattr(a, "now", None) or dt.datetime.now()  # tests pass an old time instead of renaming a snapshot
     name = now.strftime(STAMP)
     if (base / name).exists():
         name = now.strftime(STAMP + "-%S")
@@ -428,8 +452,9 @@ def mirror_state(c: dict, name: str, src: str) -> dict:
 def status(c: dict | None = None, detail_all: bool = False) -> dict:
     c = c or cfg()
     rs = repos(c)
-    platform = [mirror_state(c, n, p) for n, p in c["repos"].items()]
-    belt = [n for n in rs if n not in c["repos"]]
+    plat = platform_repos(c)
+    platform = [mirror_state(c, n, p) for n, p in plat.items()]
+    belt = [n for n in rs if n not in plat]
     belt_mirrored = sum(1 for n in belt if mirror_dir(c, n).is_dir())
     ss = snaps(c)
     latest = None
@@ -449,7 +474,7 @@ def status(c: dict | None = None, detail_all: bool = False) -> dict:
         rpo["snapshot_min"] = round((now - dt.datetime.fromisoformat(latest["at"])).total_seconds() / 60)
     for p in platform:
         if p["is_repo"] and not p["covered"]:
-            _, ct = git("log", "-1", "--format=%ct", cwd=c["repos"][p["repo"]])
+            _, ct = git("log", "-1", "--format=%ct", cwd=plat[p["repo"]])
             if ct.strip().isdigit():
                 rpo["unmirrored"].append({"repo": p["repo"], "minutes": round((now.timestamp() - int(ct)) / 60)})
     ages = ([rpo["snapshot_min"]] if rpo["snapshot_min"] is not None else []) + [u["minutes"] for u in rpo["unmirrored"]]
@@ -770,10 +795,11 @@ def cmd_run(a, c) -> int:
     logd.mkdir(parents=True, exist_ok=True)
     t0 = dt.datetime.now()
     lines, mirrors = [], {}
+    plat = platform_repos(c)
     for n, p in repos(c).items():
         state, msg = mirror_one(c, n, p, init=True)
         mirrors[n] = state
-        if state != "skipped" or n in c["repos"]:
+        if state != "skipped" or n in plat:
             lines.append(f"mirror {n}: {state}: {msg}")
         if mirror_dir(c, n).is_dir():
             ensure_hook(mirror_dir(c, n))
