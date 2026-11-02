@@ -201,6 +201,8 @@ def mirror_one(c: dict, name: str, src: str, init: bool) -> tuple[str, str]:
     if not (Path(src) / ".git").exists():
         return "skipped", "no .git (not a repo now)"
     code, refs = git("for-each-ref", "--count=1", "refs/heads", "refs/tags", cwd=src)
+    if code != 0 and "not a git repository" in refs:
+        return "skipped", "stale worktree or broken .git: " + refs.strip().splitlines()[-1].strip()
     if code == 0 and not refs.strip():
         return "skipped", "no commits yet"
     m = mirror_dir(c, name)

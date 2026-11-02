@@ -45,6 +45,15 @@ class BackupTest(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    def test_mirror_skips_stale_worktree(self):
+        stale = self.tmp / "stale-wt"
+        stale.mkdir()
+        (stale / ".git").write_text(f"gitdir: {(self.tmp / 'missing').as_posix()}/.git/worktrees/x", encoding="utf-8")
+        state, msg = backup.mirror_one(self.c, "stale", str(stale), init=True)
+        self.assertEqual(state, "skipped")
+        self.assertIn("stale worktree", msg)
+        self.assertFalse(backup.mirror_dir(self.c, "stale").exists())
+
     def test_mirror_adds_history_never_removes(self):
         self.assertEqual(backup.mirror_one(self.c, "repo", str(self.src), init=False)[0], "skipped")
         state, msg = backup.mirror_one(self.c, "repo", str(self.src), init=True)
